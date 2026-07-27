@@ -20,8 +20,8 @@ from src.feature_engineering import build_features
 from src.models.arima_model import ARIMAForecaster, SARIMAForecaster
 
 
-st.set_page_config(page_title="Stock Volatility Forecasting", layout="wide", page_icon="📈")
-st.title("Stock Price Volatility Forecasting")
+st.set_page_config(page_title="VolatiliX — Volatility Forecasting", layout="wide", page_icon="📈")
+st.title("VolatiliX: Multi-Asset Financial Analytics")
 st.caption("ARIMA / SARIMA / Prophet / LSTM with technical indicators and backtesting")
 
 
@@ -199,7 +199,7 @@ with tab_forecast:
                 fc = pd.Series(fc.values[:steps], index=test.index, name="Prophet")
                 forecasts["Prophet"] = fc
             except Exception as exc:
-                st.warning(f"Prophet failed: {exc}")
+                st.warning(f"⚠️ Prophet unavailable: {exc}. Install locally with `pip install prophet`.")
         done += 1
         progress.progress(done / n_models)
 
@@ -212,7 +212,7 @@ with tab_forecast:
                 fc = m.predict_on_test(train, test)
                 forecasts["LSTM"] = fc
             except Exception as exc:
-                st.warning(f"LSTM failed: {exc}")
+                st.warning(f"⚠️ LSTM unavailable: {exc}. Install locally with `pip install tensorflow`.")
         done += 1
         progress.progress(done / n_models)
 
