@@ -107,3 +107,14 @@ class LSTMForecaster:
             preds.append(yhat)
         out = self.scaler.inverse_transform(np.array(preds).reshape(-1, 1)).flatten()
         return pd.Series(out, index=test.index, name="forecast")
+
+    def walk_forward_forecast(
+        self, train: pd.Series, test: pd.Series, refit_every: int = 20,
+    ) -> pd.Series:
+        """Walk-forward wrapper — delegates to predict_on_test for LSTM.
+
+        The LSTM's predict_on_test already does step-wise prediction
+        using ground-truth context windows, so this is a thin wrapper
+        for API consistency with the ARIMA/SARIMA forecasters.
+        """
+        return self.predict_on_test(train, test)

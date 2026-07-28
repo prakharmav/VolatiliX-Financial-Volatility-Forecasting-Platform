@@ -28,10 +28,10 @@ models:
     yearly_seasonality: true
     changepoint_prior_scale: 0.05
   lstm:
-    lookback: 30
-    units: 64
+    lookback: 20
+    units: 128
     dropout: 0.2
-    epochs: 30
+    epochs: 50
     batch_size: 32
     learning_rate: 0.001
 
@@ -41,6 +41,17 @@ forecast:
 backtest:
   initial_cash: 10000
   transaction_cost: 0.001
+
+strategy:
+  min_agreement: 0.5
+  vol_window: 21
+  target_vol: 0.15
+  max_position: 1.0
+  rsi_upper: 70.0
+  stop_pct: 0.05
+  cooldown: 3
+  refit_every: 20
+  use_walk_forward: true
 
 paths:
   results: "results"

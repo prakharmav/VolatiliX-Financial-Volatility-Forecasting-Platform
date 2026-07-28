@@ -12,12 +12,19 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from src.backtest import backtest_strategy, performance_stats, signal_from_forecast
+from src.backtest import (
+    backtest_strategy,
+    backtest_enhanced,
+    performance_stats,
+    performance_stats_enhanced,
+    signal_from_forecast,
+)
 from src.config import load_config
 from src.data_loader import download_data
 from src.evaluation import evaluate_all
 from src.feature_engineering import build_features
 from src.models.arima_model import ARIMAForecaster, SARIMAForecaster
+from src.strategy import build_enhanced_strategy
 
 
 st.set_page_config(page_title="VolatiliX — Volatility Forecasting", layout="wide", page_icon="📈")
@@ -61,10 +68,34 @@ with st.sidebar:
     use_sarima = st.checkbox("SARIMA", True)
     use_prophet = st.checkbox("Prophet", False)
     use_lstm = st.checkbox("LSTM (slower)", False)
+    use_walk_forward = st.checkbox("Walk-forward forecasting", True,
+                                    help="Re-fit ARIMA/SARIMA every N steps to prevent forecast drift")
+    refit_every = st.number_input("Refit every (days)", value=20, min_value=5, max_value=60, step=5,
+                                   help="Walk-forward re-fitting frequency")
 
     st.subheader("Backtest")
     cost = st.number_input("Transaction cost", value=cfg["backtest"]["transaction_cost"], step=0.0005, format="%.4f")
     cash = st.number_input("Initial cash", value=float(cfg["backtest"]["initial_cash"]), step=1000.0)
+
+    st.subheader("Enhanced Strategy")
+    strat_cfg = cfg.get("strategy", {})
+    use_enhanced = st.checkbox("Use enhanced strategy", True,
+                                help="Ensemble voting + vol-sizing + RSI/BB filter + trailing stop")
+    min_agreement = st.slider("Ensemble agreement", 0.3, 1.0,
+                               strat_cfg.get("min_agreement", 0.5), 0.1,
+                               help="Fraction of models that must agree for a buy signal")
+    target_vol = st.slider("Target volatility", 0.05, 0.40,
+                            strat_cfg.get("target_vol", 0.15), 0.05,
+                            help="Target annualised vol for position sizing")
+    stop_pct = st.slider("Trailing stop %", 0.02, 0.15,
+                          strat_cfg.get("stop_pct", 0.05), 0.01,
+                          help="Exit when price drops this % from peak")
+    cooldown = st.number_input("Cooldown (days)", value=strat_cfg.get("cooldown", 3),
+                                min_value=0, max_value=10,
+                                help="Days to wait after stop-out before re-entry")
+    rsi_upper = st.slider("RSI overbought filter", 60.0, 90.0,
+                           strat_cfg.get("rsi_upper", 70.0), 5.0,
+                           help="Suppress buys when RSI exceeds this")
 
     run_btn = st.button("Run forecast", type="primary", use_container_width=True)
 
@@ -166,8 +197,11 @@ with tab_forecast:
         with st.spinner("Fitting ARIMA..."):
             try:
                 m = ARIMAForecaster(order=cfg["models"]["arima"]["order"]).fit(train)
-                fc = m.forecast(steps)
-                fc.index = test.index
+                if use_walk_forward:
+                    fc = m.walk_forward_forecast(train, test, refit_every=refit_every)
+                else:
+                    fc = m.forecast(steps)
+                    fc.index = test.index
                 forecasts["ARIMA"] = fc
             except Exception as exc:
                 st.warning(f"ARIMA failed: {exc}")
@@ -181,8 +215,11 @@ with tab_forecast:
                     order=cfg["models"]["sarima"]["order"],
                     seasonal_order=cfg["models"]["sarima"]["seasonal_order"],
                 ).fit(train)
-                fc = m.forecast(steps)
-                fc.index = test.index
+                if use_walk_forward:
+                    fc = m.walk_forward_forecast(train, test, refit_every=refit_every)
+                else:
+                    fc = m.forecast(steps)
+                    fc.index = test.index
                 forecasts["SARIMA"] = fc
             except Exception as exc:
                 st.warning(f"SARIMA failed: {exc}")
@@ -237,7 +274,53 @@ with tab_forecast:
 
 with tab_backtest:
     best = metrics["RMSE"].idxmin()
-    chosen = st.selectbox("Choose model for backtest", list(forecasts.keys()), index=list(forecasts.keys()).index(best))
+
+    if use_enhanced and len(forecasts) >= 1:
+        st.subheader("🔥 Enhanced Strategy (Ensemble + Filters + Vol-Sizing)")
+
+        test_features = feats.loc[test.index]
+        position = build_enhanced_strategy(
+            forecasts,
+            test,
+            test_features,
+            min_agreement=min_agreement,
+            vol_window=strat_cfg.get("vol_window", 21),
+            target_vol=target_vol,
+            max_position=strat_cfg.get("max_position", 1.0),
+            rsi_upper=rsi_upper,
+            stop_pct=stop_pct,
+            cooldown=cooldown,
+        )
+        bt_enh = backtest_enhanced(test, position, initial_cash=cash, transaction_cost=cost)
+        stats_enh = performance_stats_enhanced(bt_enh)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Strategy return", f"{stats_enh['total_return']*100:.2f}%")
+        c2.metric("Sharpe", f"{stats_enh['sharpe']:.2f}")
+        c3.metric("Max drawdown", f"{stats_enh['max_drawdown']*100:.2f}%")
+        c4.metric("Win rate", f"{stats_enh['win_rate']*100:.1f}%")
+        c5.metric("Profit factor", f"{stats_enh['profit_factor']:.2f}")
+
+        c6, c7, c8 = st.columns(3)
+        c6.metric("Annualized return", f"{stats_enh['annualized_return']*100:.2f}%")
+        c7.metric("Calmar ratio", f"{stats_enh['calmar_ratio']:.2f}")
+        c8.metric("Buy & hold", f"{stats_enh['buy_hold_return']*100:.2f}%")
+
+        f_enh = go.Figure()
+        f_enh.add_trace(go.Scatter(x=bt_enh.index, y=bt_enh["equity"], name="Enhanced strategy", line=dict(width=2, color="#00cc96")))
+        f_enh.add_trace(go.Scatter(x=bt_enh.index, y=bt_enh["buy_hold_equity"], name="Buy & hold", line=dict(dash="dash", color="grey")))
+        f_enh.update_layout(title="Enhanced Strategy — Equity Curve", height=500, yaxis_title="Portfolio value")
+        st.plotly_chart(f_enh, use_container_width=True)
+
+        st.caption(f"Models: {', '.join(forecasts.keys())}  •  "
+                   f"Agreement: {min_agreement:.0%}  •  "
+                   f"Stop-loss: {stop_pct:.0%}  •  "
+                   f"Trades: {stats_enh['num_trades']}")
+
+    st.divider()
+    st.subheader("📊 Original Strategy (single model, binary signal)")
+
+    chosen = st.selectbox("Choose model for original backtest", list(forecasts.keys()), index=list(forecasts.keys()).index(best))
 
     fc = forecasts[chosen]
     sig = signal_from_forecast(fc, test)
@@ -253,7 +336,7 @@ with tab_backtest:
     f = go.Figure()
     f.add_trace(go.Scatter(x=bt.index, y=bt["equity"], name=f"{chosen} strategy", line=dict(width=2)))
     f.add_trace(go.Scatter(x=bt.index, y=bt["buy_hold_equity"], name="Buy & hold", line=dict(dash="dash")))
-    f.update_layout(title="Equity Curve", height=500, yaxis_title="Portfolio value")
+    f.update_layout(title="Original Strategy — Equity Curve", height=500, yaxis_title="Portfolio value")
     st.plotly_chart(f, use_container_width=True)
 
     st.caption(f"Trades: {stats['num_trades']}  •  Transaction cost: {cost:.4f}")

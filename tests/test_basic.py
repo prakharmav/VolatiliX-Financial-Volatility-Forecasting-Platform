@@ -79,3 +79,73 @@ def test_backtest_runs():
     stats = performance_stats(bt)
     assert "total_return" in stats
     assert len(bt) == len(prices)
+
+
+# ---------------------------------------------------------------------------
+#  New tests for enhanced strategy components
+# ---------------------------------------------------------------------------
+
+def test_ensemble_signal():
+    from src.strategy import ensemble_signal
+
+    idx = pd.bdate_range("2022-01-01", periods=50)
+    prices = pd.Series(np.linspace(100, 120, 50), index=idx)
+    # Two forecasts: one always above price, one always below
+    fc_up = pd.Series(np.linspace(105, 125, 50), index=idx)
+    fc_down = pd.Series(np.linspace(95, 115, 50), index=idx)
+
+    # With 50% agreement both should trigger (1 of 2 agrees)
+    sig = ensemble_signal({"up": fc_up, "down": fc_down}, prices, min_agreement=0.5)
+    assert len(sig) == 50
+    assert sig.dtype in (int, np.int64, np.int32)
+
+    # With 100% agreement, only when both agree
+    sig_strict = ensemble_signal({"up": fc_up, "down": fc_down}, prices, min_agreement=1.0)
+    assert sig_strict.sum() <= sig.sum()  # stricter = fewer buy signals
+
+
+def test_volatility_position_sizing():
+    from src.strategy import volatility_position_sizing
+
+    idx = pd.bdate_range("2022-01-01", periods=100)
+    prices = pd.Series(100 * np.exp(np.cumsum(np.random.default_rng(1).normal(0, 0.02, 100))), index=idx)
+    signal = pd.Series(np.ones(100), index=idx)
+
+    sized = volatility_position_sizing(signal, prices, vol_window=10, target_vol=0.15)
+    assert len(sized) == 100
+    assert (sized >= 0).all()
+    assert (sized <= 1.0).all()
+    # When signal is 0, position should be 0
+    sig_zero = pd.Series(np.zeros(100), index=idx)
+    sized_zero = volatility_position_sizing(sig_zero, prices, vol_window=10)
+    assert (sized_zero == 0).all()
+
+
+def test_backtest_enhanced():
+    from src.backtest import backtest_enhanced, performance_stats_enhanced
+
+    df = _synthetic_ohlcv(n=200)
+    prices = df["Close"]
+    # Fractional positions
+    positions = pd.Series(np.random.default_rng(42).uniform(0, 1, len(prices)), index=prices.index)
+    bt = backtest_enhanced(prices, positions)
+    stats = performance_stats_enhanced(bt)
+    assert "total_return" in stats
+    assert "win_rate" in stats
+    assert "profit_factor" in stats
+    assert "calmar_ratio" in stats
+    assert "annualized_return" in stats
+    assert len(bt) == len(prices)
+
+
+def test_arima_walk_forward():
+    from src.models.arima_model import ARIMAForecaster
+
+    df = _synthetic_ohlcv(n=300)
+    close = df["Close"]
+    train, test = close.iloc[:240], close.iloc[240:]
+    m = ARIMAForecaster(order=(1, 1, 0)).fit(train)
+    fc = m.walk_forward_forecast(train, test, refit_every=10)
+    assert len(fc) == len(test)
+    assert fc.notna().all()
+    assert (fc.index == test.index).all()
