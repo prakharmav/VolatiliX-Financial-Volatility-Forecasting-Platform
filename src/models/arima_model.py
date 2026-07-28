@@ -34,11 +34,14 @@ class ARIMAForecaster:
     def walk_forward_forecast(
         self, train: pd.Series, test: pd.Series, refit_every: int = 20,
     ) -> pd.Series:
-        """Walk-forward forecast: re-fit on expanding data every *refit_every* steps.
+        """Walk-forward forecast: fast state update on expanding data every *refit_every* steps.
 
-        This prevents the massive drift that occurs when forecasting
-        hundreds of steps in one shot from a single ARIMA fit.
+        Uses statsmodels `.apply(..., refit=False)` for fast state updating without
+        repeating full MLE optimization, preventing forecast drift in sub-second time.
         """
+        if self.fitted_ is None:
+            self.fit(train)
+
         preds = []
         combined = pd.concat([train, test])
         for start in range(0, len(test), refit_every):
@@ -46,13 +49,18 @@ class ARIMAForecaster:
             train_end = len(train) + start
             history = combined.iloc[:train_end]
             try:
-                model = ARIMA(history.astype(float), order=self.order)
-                fitted = model.fit()
-                chunk = fitted.forecast(steps=end - start)
+                updated = self.fitted_.apply(history.astype(float), refit=False)
+                chunk = updated.forecast(steps=end - start)
                 preds.extend(chunk.values)
             except Exception:
-                # Fallback: repeat last known value
-                preds.extend([history.iloc[-1]] * (end - start))
+                # Fallback: re-fit
+                try:
+                    model = ARIMA(history.astype(float), order=self.order)
+                    fitted = model.fit()
+                    chunk = fitted.forecast(steps=end - start)
+                    preds.extend(chunk.values)
+                except Exception:
+                    preds.extend([history.iloc[-1]] * (end - start))
         return pd.Series(preds[: len(test)], index=test.index, name="forecast")
 
 
@@ -86,7 +94,10 @@ class SARIMAForecaster:
     def walk_forward_forecast(
         self, train: pd.Series, test: pd.Series, refit_every: int = 20,
     ) -> pd.Series:
-        """Walk-forward forecast for SARIMA with periodic re-fitting."""
+        """Walk-forward forecast for SARIMA with fast state updating."""
+        if self.fitted_ is None:
+            self.fit(train)
+
         preds = []
         combined = pd.concat([train, test])
         for start in range(0, len(test), refit_every):
@@ -94,16 +105,21 @@ class SARIMAForecaster:
             train_end = len(train) + start
             history = combined.iloc[:train_end]
             try:
-                model = SARIMAX(
-                    history.astype(float),
-                    order=self.order,
-                    seasonal_order=self.seasonal_order,
-                    enforce_stationarity=False,
-                    enforce_invertibility=False,
-                )
-                fitted = model.fit(disp=False)
-                chunk = fitted.forecast(steps=end - start)
+                updated = self.fitted_.apply(history.astype(float), refit=False)
+                chunk = updated.forecast(steps=end - start)
                 preds.extend(chunk.values)
             except Exception:
-                preds.extend([history.iloc[-1]] * (end - start))
+                try:
+                    model = SARIMAX(
+                        history.astype(float),
+                        order=self.order,
+                        seasonal_order=self.seasonal_order,
+                        enforce_stationarity=False,
+                        enforce_invertibility=False,
+                    )
+                    fitted = model.fit(disp=False)
+                    chunk = fitted.forecast(steps=end - start)
+                    preds.extend(chunk.values)
+                except Exception:
+                    preds.extend([history.iloc[-1]] * (end - start))
         return pd.Series(preds[: len(test)], index=test.index, name="forecast")

@@ -69,11 +69,11 @@ with st.sidebar:
     use_prophet = st.checkbox("Prophet", False)
     use_lstm = st.checkbox("LSTM (slower)", False)
     use_walk_forward = st.checkbox("Walk-forward forecasting", True,
-                                    help="Re-fit ARIMA/SARIMA every N steps to prevent forecast drift")
+                                    help="Fast state-updating walk-forward to prevent forecast drift")
     refit_every = st.number_input("Refit every (days)", value=20, min_value=5, max_value=60, step=5,
-                                   help="Walk-forward re-fitting frequency")
+                                   help="Walk-forward update step size")
 
-    st.subheader("Backtest")
+    st.subheader("Backtest Settings")
     cost = st.number_input("Transaction cost", value=cfg["backtest"]["transaction_cost"], step=0.0005, format="%.4f")
     cash = st.number_input("Initial cash", value=float(cfg["backtest"]["initial_cash"]), step=1000.0)
 
@@ -97,11 +97,11 @@ with st.sidebar:
                            strat_cfg.get("rsi_upper", 70.0), 5.0,
                            help="Suppress buys when RSI exceeds this")
 
-    run_btn = st.button("Run forecast", type="primary", use_container_width=True)
+    run_btn = st.button("Run forecast & backtest", type="primary", use_container_width=True)
 
 
 if not run_btn:
-    st.info("Configure parameters in the sidebar and click **Run forecast**.")
+    st.info("Configure parameters in the sidebar and click **Run forecast & backtest**.")
     st.stop()
 
 with st.spinner(f"Downloading {ticker}..."):
@@ -112,7 +112,70 @@ with st.spinner(f"Downloading {ticker}..."):
         st.stop()
 
 feats = _features(raw, cfg)
-st.success(f"Loaded {len(feats)} rows for {ticker}")
+
+price = feats["Close"]
+n_train = int(len(price) * train_ratio)
+train, test = price.iloc[:n_train], price.iloc[n_train:]
+steps = len(test)
+
+forecasts: dict[str, pd.Series] = {}
+
+# Compute model forecasts upfront
+with st.spinner("Generating model forecasts..."):
+    if use_arima:
+        try:
+            m = ARIMAForecaster(order=cfg["models"]["arima"]["order"]).fit(train)
+            if use_walk_forward:
+                fc = m.walk_forward_forecast(train, test, refit_every=refit_every)
+            else:
+                fc = m.forecast(steps)
+                fc.index = test.index
+            forecasts["ARIMA"] = fc
+        except Exception as exc:
+            st.warning(f"ARIMA failed: {exc}")
+
+    if use_sarima:
+        try:
+            m = SARIMAForecaster(
+                order=cfg["models"]["sarima"]["order"],
+                seasonal_order=cfg["models"]["sarima"]["seasonal_order"],
+            ).fit(train)
+            if use_walk_forward:
+                fc = m.walk_forward_forecast(train, test, refit_every=refit_every)
+            else:
+                fc = m.forecast(steps)
+                fc.index = test.index
+            forecasts["SARIMA"] = fc
+        except Exception as exc:
+            st.warning(f"SARIMA failed: {exc}")
+
+    if use_prophet:
+        try:
+            from src.models.prophet_model import ProphetForecaster
+
+            m = ProphetForecaster(**cfg["models"]["prophet"]).fit(train)
+            fc = m.forecast(steps)
+            fc = pd.Series(fc.values[:steps], index=test.index, name="Prophet")
+            forecasts["Prophet"] = fc
+        except Exception as exc:
+            st.warning(f"⚠️ Prophet unavailable: {exc}. Install locally with `pip install prophet`.")
+
+    if use_lstm:
+        try:
+            from src.models.lstm_model import LSTMForecaster
+
+            m = LSTMForecaster(**cfg["models"]["lstm"]).fit(train, verbose=0)
+            fc = m.predict_on_test(train, test)
+            forecasts["LSTM"] = fc
+        except Exception as exc:
+            st.warning(f"⚠️ LSTM unavailable: {exc}. Install locally with `pip install tensorflow`.")
+
+if not forecasts:
+    st.error("No models produced forecasts. Please select at least one valid model.")
+    st.stop()
+
+metrics = evaluate_all(forecasts, test)
+st.success(f"Loaded {len(feats)} rows for {ticker}. Forecasts generated for {', '.join(forecasts.keys())}.")
 
 tab_overview, tab_indicators, tab_forecast, tab_backtest = st.tabs(
     ["Overview", "Indicators", "Forecasts", "Backtest"]
@@ -180,85 +243,7 @@ with tab_indicators:
         f4.update_layout(title="MACD", height=400)
         st.plotly_chart(f4, use_container_width=True)
 
-
-price = feats["Close"]
-n_train = int(len(price) * train_ratio)
-train, test = price.iloc[:n_train], price.iloc[n_train:]
-steps = len(test)
-
-forecasts: dict[str, pd.Series] = {}
-
 with tab_forecast:
-    progress = st.progress(0.0)
-    n_models = sum([use_arima, use_sarima, use_prophet, use_lstm]) or 1
-    done = 0
-
-    if use_arima:
-        with st.spinner("Fitting ARIMA..."):
-            try:
-                m = ARIMAForecaster(order=cfg["models"]["arima"]["order"]).fit(train)
-                if use_walk_forward:
-                    fc = m.walk_forward_forecast(train, test, refit_every=refit_every)
-                else:
-                    fc = m.forecast(steps)
-                    fc.index = test.index
-                forecasts["ARIMA"] = fc
-            except Exception as exc:
-                st.warning(f"ARIMA failed: {exc}")
-        done += 1
-        progress.progress(done / n_models)
-
-    if use_sarima:
-        with st.spinner("Fitting SARIMA..."):
-            try:
-                m = SARIMAForecaster(
-                    order=cfg["models"]["sarima"]["order"],
-                    seasonal_order=cfg["models"]["sarima"]["seasonal_order"],
-                ).fit(train)
-                if use_walk_forward:
-                    fc = m.walk_forward_forecast(train, test, refit_every=refit_every)
-                else:
-                    fc = m.forecast(steps)
-                    fc.index = test.index
-                forecasts["SARIMA"] = fc
-            except Exception as exc:
-                st.warning(f"SARIMA failed: {exc}")
-        done += 1
-        progress.progress(done / n_models)
-
-    if use_prophet:
-        with st.spinner("Fitting Prophet..."):
-            try:
-                from src.models.prophet_model import ProphetForecaster
-
-                m = ProphetForecaster(**cfg["models"]["prophet"]).fit(train)
-                fc = m.forecast(steps)
-                fc = pd.Series(fc.values[:steps], index=test.index, name="Prophet")
-                forecasts["Prophet"] = fc
-            except Exception as exc:
-                st.warning(f"⚠️ Prophet unavailable: {exc}. Install locally with `pip install prophet`.")
-        done += 1
-        progress.progress(done / n_models)
-
-    if use_lstm:
-        with st.spinner("Training LSTM (this can take a minute)..."):
-            try:
-                from src.models.lstm_model import LSTMForecaster
-
-                m = LSTMForecaster(**cfg["models"]["lstm"]).fit(train, verbose=0)
-                fc = m.predict_on_test(train, test)
-                forecasts["LSTM"] = fc
-            except Exception as exc:
-                st.warning(f"⚠️ LSTM unavailable: {exc}. Install locally with `pip install tensorflow`.")
-        done += 1
-        progress.progress(done / n_models)
-
-    progress.empty()
-
-    if not forecasts:
-        st.error("No models produced forecasts.")
-        st.stop()
-
     f = go.Figure()
     f.add_trace(go.Scatter(x=train.index[-200:], y=train.values[-200:], name="Train (recent)", line=dict(color="lightgrey")))
     f.add_trace(go.Scatter(x=test.index, y=test.values, name="Actual", line=dict(color="black", width=2)))
@@ -267,10 +252,8 @@ with tab_forecast:
     f.update_layout(title=f"{ticker} — Close Price Forecasts", height=550)
     st.plotly_chart(f, use_container_width=True)
 
-    metrics = evaluate_all(forecasts, test)
     st.subheader("Evaluation Metrics")
     st.dataframe(metrics.style.format("{:.4f}").background_gradient(cmap="RdYlGn_r", subset=["RMSE", "MAE", "MAPE"]))
-
 
 with tab_backtest:
     best = metrics["RMSE"].idxmin()
